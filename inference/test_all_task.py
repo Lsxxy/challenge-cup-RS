@@ -145,137 +145,141 @@ def calculate_final_scores(results):
     return S_final
 
 
-#使用vllm进行分布式预测################################################################################################
-def run_vllm_inference(llm, tokenizer, tasks, image_base_path_dict, sampling_params):
+#单卡使用的inference和主函数##########################################################################################
+def run_batch_inference(model, tokenizer, tasks, image_base_path_dict, batch_size=8):
     """
-    使用 vLLM 对所有任务进行统一的、并行的推理。
+    对所有任务进行统一的、批量的推理。
     """
-    # 1. 准备 vLLM 需要的输入
-    prompts_for_vllm = []
-    multi_modal_data_for_vllm = []
-    valid_tasks = [] # 只保留图像加载成功的任务
-
-    print("Preparing inputs for vLLM...")
-    for task in tqdm(tasks, desc="Loading images and building prompts"):
-        # 拼接完整的图像路径
-        if task['task_type'] == 'mme_vqa':
-            full_image_path = os.path.join(image_base_path_dict['mme_vqa'], task['image_path'])
-        else:
-            full_image_path = os.path.join(image_base_path_dict[task['task_type']], task['image_path'])
-
-        try:
-            image = Image.open(full_image_path).convert('RGB')
-        except FileNotFoundError:
-            print(f"Warning: Image not found at {full_image_path}. Skipping task {task['task_id']}.")
-            continue
-        
-        # 获取文本 prompt
-        text_prompt = build_prompt_for_task(task)
-        
-        # 构建 vLLM 需要的最终 prompt (包含图像占位符)
-        # 你的模型使用的占位符可能是 <image> 或其他，请根据模型文档确认
-        final_prompt = f"<image>\n{text_prompt}"
-        
-        # 使用 apply_chat_template 格式化
-        formatted_prompt = tokenizer.apply_chat_template(
-            conversation=[{'role': 'user', 'content': final_prompt}],
-            add_generation_prompt=True,
-            tokenize=False
-        )
-        
-        prompts_for_vllm.append(formatted_prompt)
-        multi_modal_data_for_vllm.append(MultiModalData(image=image))
-        valid_tasks.append(task)
-
-    # 2. 执行 vLLM 并行推理
-    print(f"\nRunning inference on {len(prompts_for_vllm)} tasks with vLLM...")
-    outputs = llm.generate(
-        prompts_for_vllm, 
-        sampling_params, 
-        multi_modal_data=multi_modal_data_for_vllm
-    )
-    print("Inference completed.")
-
-    # 3. 解析和整理输出结果
     results = []
-    print("Parsing outputs...")
-    for i, output in enumerate(tqdm(outputs, desc="Parsing results")):
-        task = valid_tasks[i]
-        raw_output = output.outputs[0].text
-        
-        # 复用你之前的解析逻辑
-        if task['task_type'] == 'mme_vqa':
-            choices_list = task['prompt_info']['choices']
-            parsed_answer = extract_characters_regex(raw_output, choices_list)
-        elif task['task_type'] == 'vrs_referring':
-            match = re.search(r'\{?<?(\d+)>?<?(\d+)>?<?(\d+)>?<?(\d+)>?\}?', str(raw_output))
-            if match:
-                parsed_answer = f"{{<{match.group(1)}><{match.group(2)}><{match.group(3)}><{match.group(4)}>}}"
-            else:
-                parsed_answer = "PARSE_ERROR"
-        else: # for caption and vrs_vqa
-            parsed_answer = str(raw_output).strip()
-        
-        # 保存格式化的结果
-        results.append({
-            'task_id': task['task_id'],
-            'task_type': task['task_type'],
-            'model_output': parsed_answer,
-            'ground_truth': task['ground_truth'],
-            'choices': task['prompt_info'].get('choices', [])
-        })
-        
-    return results
-
-
-if __name__ == '__main__':
-    # --- 1. 定义超参数 ---
-    MODEL_FILE = '/root/Documents/code/FM9G4B-V/model/'
-    # 设置你想使用的GPU数量
-    TENSOR_PARALLEL_SIZE = 4 
     
-    # --- 2. 初始化 vLLM 模型和 Tokenizer ---
-    print("Initializing vLLM...")
-    llm = LLM(
-        model=MODEL_FILE,
-        tensor_parallel_size=TENSOR_PARALLEL_SIZE,
+    # 开启推理模式，关闭梯度计算以加速并节省内存
+    with torch.inference_mode():
+        # 手动创建批次进行循环
+        for i in tqdm(range(0, len(tasks), batch_size), desc="Running Batch Inference"):
+            # 1. 获取当前批次的任务
+            batch_tasks = tasks[i:i+batch_size]
+            
+            # --- 2. 批量构建模型输入 (msgs) ---
+            batch_msgs = []
+            for task in batch_tasks:
+                # 拼接完整的图像路径
+                # 注意：MME的 image_path 已经是 "remote_sensing/..." 的形式了
+                if task['task_type'] == 'mme_vqa':
+                    full_image_path = os.path.join(image_base_path_dict['mme_vqa'], task['image_path'])
+                else:
+                    full_image_path = os.path.join(image_base_path_dict[task['task_type']], task['image_path'])
+
+                try:
+                    image = Image.open(full_image_path).convert('RGB')
+                except FileNotFoundError:
+                    print(f"Warning: Image not found at {full_image_path}. Skipping task {task['task_id']}.")
+                    # 添加一个错误标记，方便后续跳过
+                    batch_msgs.append("IMAGE_NOT_FOUND")
+                    continue
+                
+                # 构建单个任务的 prompt
+                prompt = build_prompt_for_task(task)
+                
+                # 构建符合 model.chat 格式的输入
+                batch_msgs.append([{'role': 'user', 'content': [image, prompt]}])
+
+            # 过滤掉图像加载失败的样本
+            valid_batch_tasks = [task for task, msg in zip(batch_tasks, batch_msgs) if msg != "IMAGE_NOT_FOUND"]
+            valid_batch_msgs = [msg for msg in batch_msgs if msg != "IMAGE_NOT_FOUND"]
+            
+            if not valid_batch_msgs:
+                continue
+
+            # --- 3. 批量模型推理 ---
+            try:
+                # 这是根据 chat.py 确定的真实批量调用方式！
+                raw_outputs = model.chat(
+                    image=None,
+                    msgs=valid_batch_msgs,
+                    tokenizer=tokenizer,
+                    max_new_tokens=256 # 限制输出长度，可以根据任务调整
+                )
+            except Exception as e:
+                # 捕获到任何异常
+                print("\n" + "="*50)
+                print(f"FATAL ERROR: An exception occurred during model inference for the batch starting at index {i}.")
+                print(f"Stopping the program.")
+                print(f"Error Type: {type(e).__name__}")
+                print(f"Error Details: {e}")
+                print("="*50)
+                # 重新抛出异常，使程序终止
+                raise e
+            
+            # raw_outputs 现在是一个列表，长度等于 valid_batch_msgs 的长度
+
+            # --- 4. 批量解析和保存结果 ---
+            for task_idx, task in enumerate(valid_batch_tasks):
+                raw_output = raw_outputs[task_idx]
+                
+                # 解析输出
+                if task['task_type'] == 'mme_vqa':
+                    choices_list = task['prompt_info']['choices']
+                    parsed_answer = extract_characters_regex(raw_output, choices_list)
+                elif task['task_type'] == 'vrs_referring':
+                    match = re.search(r'\{?<?(\d+)>?<?(\d+)>?<?(\d+)>?<?(\d+)>?\}?', str(raw_output))
+                    if match:
+                        parsed_answer = f"{{<{match.group(1)}><{match.group(2)}><{match.group(3)}><{match.group(4)}>}}"
+                    else:
+                        parsed_answer = "PARSE_ERROR"
+                else: # for caption and vrs_vqa
+                    parsed_answer = str(raw_output).strip()
+
+                # 保存格式化的结果
+                results.append({
+                    'task_id': task['task_id'],
+                    'task_type': task['task_type'],
+                    'model_output': parsed_answer,
+                    'ground_truth': task['ground_truth'],
+                    'choices': task['prompt_info'].get('choices', []) # 为MME评测保存choices
+                })
+                
+    return results
+if __name__ == '__main__':
+    # 1.定义模型与分词器
+    model_file = '/root/Documents/code/FM9G4B-V/model'
+    print("Loading model and tokenizer...")
+    model = AutoModel.from_pretrained(
+        model_file, 
         trust_remote_code=True,
-        dtype='bfloat16', # 与你之前的 torch_dtype 一致
-        # 如果遇到显存不足，可以尝试降低这个值
-        gpu_memory_utilization=0.90 
-    )
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_FILE, trust_remote_code=True)
-    print("vLLM engine is ready.")
+        attn_implementation='flash_attention_2', 
+        torch_dtype=torch.bfloat16
+    ).eval().cuda()
+    tokenizer = AutoTokenizer.from_pretrained(model_file, trust_remote_code=True)
+    print("Model and tokenizer loaded.")
 
-    # --- 3. 定义采样参数 ---
-    sampling_params = SamplingParams(
-        temperature=0.0, # 对于评测，通常使用确定性采样
-        top_p=1.0,
-        max_tokens=256 # 限制最大生成长度
-    )
-
-    # --- 4. 读取和准备数据 ---
+    # 2.读取所有test_data
     print("Loading test data...")
     test_data = load_all_test_data()
     print(f"Loaded {len(test_data)} tasks in total.")
 
+    # 3.获取test_data对应的图像主路径
     image_base_path_dict = {
         'vrs_caption': '/root/Documents/code/FM9G4B-V/data/VRSBench/Images_val',
         'vrs_referring': '/root/Documents/code/FM9G4B-V/data/VRSBench/Images_val',
         'vrs_vqa': '/root/Documents/code/FM9G4B-V/data/VRSBench/Images_val',
-        'mme_vqa': '/root/Documents/code/FM9G4B-V/data/MME'
-    } 
+        'mme_vqa': '/root/Documents/code/FM9G4B-V/data/MME' # MME的Image字段包含了子目录
+    }
 
-    # --- 5. 执行 vLLM 分布式推理 ---
-    all_inference_results = run_vllm_inference(llm, tokenizer, test_data, image_base_path_dict, sampling_params)
+    # 4.获取模型对test_data的结果
+    # BATCH_SIZE可以根据你的GPU显存进行调整，从一个较小的值开始尝试，如 4 或 8
+    BATCH_SIZE =24
+    results = run_batch_inference(model, tokenizer, test_data, image_base_path_dict, batch_size=BATCH_SIZE)
     
-    # --- 6. 保存和计算最终分数 (这部分逻辑完全复用) ---
-    with open('/root/Documents/code/FM9G4B-V/data/inference_results_vllm.json', 'w') as f:
-        json.dump(all_inference_results, f, indent=4)
-    print(f"Aggregated inference results saved to 'inference_results_vllm.json'. Total items: {len(all_inference_results)}")
+    # [可选] 将中间结果保存到文件，方便调试或重复计算分数
+    with open('/root/Documents/code/FM9G4B-V/inference/inference_results.json', 'w') as f:
+        json.dump(results, f, indent=4)
+    print("Inference results saved to inference_results.json")
 
+    # 5.获取测试结果
+    # 如果是从文件加载，可以: with open('inference_results.json', 'r') as f: results = json.load(f)
     print("Calculating final scores...")
-    score = calculate_final_scores(all_inference_results)
+    score = calculate_final_scores(results)
+##############################################################################################################
 
 
 
@@ -283,152 +287,138 @@ if __name__ == '__main__':
 
 
 
-
-
-
-
-
-
-
-
-
-
-#单卡使用的inference和主函数##########################################################################################
-# def run_batch_inference(model, tokenizer, tasks, image_base_path_dict, batch_size=8):
+#使用vllm进行分布式预测################################################################################################
+# def run_vllm_inference(llm, tokenizer, tasks, image_base_path_dict, sampling_params):
 #     """
-#     对所有任务进行统一的、批量的推理。
+#     使用 vLLM 对所有任务进行统一的、并行的推理。
 #     """
+#     # 1. 准备 vLLM 需要的输入
+#     prompts_for_vllm = []
+#     multi_modal_data_for_vllm = []
+#     valid_tasks = [] # 只保留图像加载成功的任务
+
+#     print("Preparing inputs for vLLM...")
+#     for task in tqdm(tasks, desc="Loading images and building prompts"):
+#         # 拼接完整的图像路径
+#         if task['task_type'] == 'mme_vqa':
+#             full_image_path = os.path.join(image_base_path_dict['mme_vqa'], task['image_path'])
+#         else:
+#             full_image_path = os.path.join(image_base_path_dict[task['task_type']], task['image_path'])
+
+#         try:
+#             image = Image.open(full_image_path).convert('RGB')
+#         except FileNotFoundError:
+#             print(f"Warning: Image not found at {full_image_path}. Skipping task {task['task_id']}.")
+#             continue
+        
+#         # 获取文本 prompt
+#         text_prompt = build_prompt_for_task(task)
+        
+#         # 构建 vLLM 需要的最终 prompt (包含图像占位符)
+#         # 你的模型使用的占位符可能是 <image> 或其他，请根据模型文档确认
+#         final_prompt = f"<image>\n{text_prompt}"
+        
+#         # 使用 apply_chat_template 格式化
+#         formatted_prompt = tokenizer.apply_chat_template(
+#             conversation=[{'role': 'user', 'content': final_prompt}],
+#             add_generation_prompt=True,
+#             tokenize=False
+#         )
+        
+#         prompts_for_vllm.append(formatted_prompt)
+#         multi_modal_data_for_vllm.append(MultiModalData(image=image))
+#         valid_tasks.append(task)
+
+#     # 2. 执行 vLLM 并行推理
+#     print(f"\nRunning inference on {len(prompts_for_vllm)} tasks with vLLM...")
+#     outputs = llm.generate(
+#         prompts_for_vllm, 
+#         sampling_params, 
+#         multi_modal_data=multi_modal_data_for_vllm
+#     )
+#     print("Inference completed.")
+
+#     # 3. 解析和整理输出结果
 #     results = []
-    
-#     # 开启推理模式，关闭梯度计算以加速并节省内存
-#     with torch.inference_mode():
-#         # 手动创建批次进行循环
-#         for i in tqdm(range(0, len(tasks), batch_size), desc="Running Batch Inference"):
-#             # 1. 获取当前批次的任务
-#             batch_tasks = tasks[i:i+batch_size]
-            
-#             # --- 2. 批量构建模型输入 (msgs) ---
-#             batch_msgs = []
-#             for task in batch_tasks:
-#                 # 拼接完整的图像路径
-#                 # 注意：MME的 image_path 已经是 "remote_sensing/..." 的形式了
-#                 if task['task_type'] == 'mme_vqa':
-#                     full_image_path = os.path.join(image_base_path_dict['mme_vqa'], task['image_path'])
-#                 else:
-#                     full_image_path = os.path.join(image_base_path_dict[task['task_type']], task['image_path'])
-
-#                 try:
-#                     image = Image.open(full_image_path).convert('RGB')
-#                 except FileNotFoundError:
-#                     print(f"Warning: Image not found at {full_image_path}. Skipping task {task['task_id']}.")
-#                     # 添加一个错误标记，方便后续跳过
-#                     batch_msgs.append("IMAGE_NOT_FOUND")
-#                     continue
-                
-#                 # 构建单个任务的 prompt
-#                 prompt = build_prompt_for_task(task)
-                
-#                 # 构建符合 model.chat 格式的输入
-#                 batch_msgs.append([{'role': 'user', 'content': [image, prompt]}])
-
-#             # 过滤掉图像加载失败的样本
-#             valid_batch_tasks = [task for task, msg in zip(batch_tasks, batch_msgs) if msg != "IMAGE_NOT_FOUND"]
-#             valid_batch_msgs = [msg for msg in batch_msgs if msg != "IMAGE_NOT_FOUND"]
-            
-#             if not valid_batch_msgs:
-#                 continue
-
-#             # --- 3. 批量模型推理 ---
-#             try:
-#                 # 这是根据 chat.py 确定的真实批量调用方式！
-#                 raw_outputs = model.chat(
-#                     image=None,
-#                     msgs=valid_batch_msgs,
-#                     tokenizer=tokenizer,
-#                     max_new_tokens=256 # 限制输出长度，可以根据任务调整
-#                 )
-#             except Exception as e:
-#                 # 捕获到任何异常
-#                 print("\n" + "="*50)
-#                 print(f"FATAL ERROR: An exception occurred during model inference for the batch starting at index {i}.")
-#                 print(f"Stopping the program.")
-#                 print(f"Error Type: {type(e).__name__}")
-#                 print(f"Error Details: {e}")
-#                 print("="*50)
-#                 # 重新抛出异常，使程序终止
-#                 raise e
-            
-#             # raw_outputs 现在是一个列表，长度等于 valid_batch_msgs 的长度
-
-#             # --- 4. 批量解析和保存结果 ---
-#             for task_idx, task in enumerate(valid_batch_tasks):
-#                 raw_output = raw_outputs[task_idx]
-                
-#                 # 解析输出
-#                 if task['task_type'] == 'mme_vqa':
-#                     choices_list = task['prompt_info']['choices']
-#                     parsed_answer = extract_characters_regex(raw_output, choices_list)
-#                 elif task['task_type'] == 'vrs_referring':
-#                     match = re.search(r'\{?<?(\d+)>?<?(\d+)>?<?(\d+)>?<?(\d+)>?\}?', str(raw_output))
-#                     if match:
-#                         parsed_answer = f"{{<{match.group(1)}><{match.group(2)}><{match.group(3)}><{match.group(4)}>}}"
-#                     else:
-#                         parsed_answer = "PARSE_ERROR"
-#                 else: # for caption and vrs_vqa
-#                     parsed_answer = str(raw_output).strip()
-
-#                 # 保存格式化的结果
-#                 results.append({
-#                     'task_id': task['task_id'],
-#                     'task_type': task['task_type'],
-#                     'model_output': parsed_answer,
-#                     'ground_truth': task['ground_truth'],
-#                     'choices': task['prompt_info'].get('choices', []) # 为MME评测保存choices
-#                 })
-                
+#     print("Parsing outputs...")
+#     for i, output in enumerate(tqdm(outputs, desc="Parsing results")):
+#         task = valid_tasks[i]
+#         raw_output = output.outputs[0].text
+        
+#         # 复用你之前的解析逻辑
+#         if task['task_type'] == 'mme_vqa':
+#             choices_list = task['prompt_info']['choices']
+#             parsed_answer = extract_characters_regex(raw_output, choices_list)
+#         elif task['task_type'] == 'vrs_referring':
+#             match = re.search(r'\{?<?(\d+)>?<?(\d+)>?<?(\d+)>?<?(\d+)>?\}?', str(raw_output))
+#             if match:
+#                 parsed_answer = f"{{<{match.group(1)}><{match.group(2)}><{match.group(3)}><{match.group(4)}>}}"
+#             else:
+#                 parsed_answer = "PARSE_ERROR"
+#         else: # for caption and vrs_vqa
+#             parsed_answer = str(raw_output).strip()
+        
+#         # 保存格式化的结果
+#         results.append({
+#             'task_id': task['task_id'],
+#             'task_type': task['task_type'],
+#             'model_output': parsed_answer,
+#             'ground_truth': task['ground_truth'],
+#             'choices': task['prompt_info'].get('choices', [])
+#         })
+        
 #     return results
-# if __name__ == '__main__':
-#     # 1.定义模型与分词器
-#     model_file = '/root/Documents/code/FM9G4B-V/model'
-#     print("Loading model and tokenizer...")
-#     model = AutoModel.from_pretrained(
-#         model_file, 
-#         trust_remote_code=True,
-#         attn_implementation='flash_attention_2', 
-#         torch_dtype=torch.bfloat16
-#     ).eval().cuda()
-#     tokenizer = AutoTokenizer.from_pretrained(model_file, trust_remote_code=True)
-#     print("Model and tokenizer loaded.")
 
-#     # 2.读取所有test_data
+
+# if __name__ == '__main__':
+#     # --- 1. 定义超参数 ---
+#     MODEL_FILE = '/root/Documents/code/FM9G4B-V/model/'
+#     # 设置你想使用的GPU数量
+#     TENSOR_PARALLEL_SIZE = 4 
+    
+#     # --- 2. 初始化 vLLM 模型和 Tokenizer ---
+#     print("Initializing vLLM...")
+#     llm = LLM(
+#         model=MODEL_FILE,
+#         tensor_parallel_size=TENSOR_PARALLEL_SIZE,
+#         trust_remote_code=True,
+#         dtype='bfloat16', # 与你之前的 torch_dtype 一致
+#         # 如果遇到显存不足，可以尝试降低这个值
+#         gpu_memory_utilization=0.90 
+#     )
+#     tokenizer = AutoTokenizer.from_pretrained(MODEL_FILE, trust_remote_code=True)
+#     print("vLLM engine is ready.")
+
+#     # --- 3. 定义采样参数 ---
+#     sampling_params = SamplingParams(
+#         temperature=0.0, # 对于评测，通常使用确定性采样
+#         top_p=1.0,
+#         max_tokens=256 # 限制最大生成长度
+#     )
+
+#     # --- 4. 读取和准备数据 ---
 #     print("Loading test data...")
 #     test_data = load_all_test_data()
 #     print(f"Loaded {len(test_data)} tasks in total.")
 
-#     # 3.获取test_data对应的图像主路径
 #     image_base_path_dict = {
 #         'vrs_caption': '/root/Documents/code/FM9G4B-V/data/VRSBench/Images_val',
 #         'vrs_referring': '/root/Documents/code/FM9G4B-V/data/VRSBench/Images_val',
 #         'vrs_vqa': '/root/Documents/code/FM9G4B-V/data/VRSBench/Images_val',
-#         'mme_vqa': '/root/Documents/code/FM9G4B-V/data/MME' # MME的Image字段包含了子目录
-#     }
+#         'mme_vqa': '/root/Documents/code/FM9G4B-V/data/MME'
+#     } 
 
-#     # 4.获取模型对test_data的结果
-#     # BATCH_SIZE可以根据你的GPU显存进行调整，从一个较小的值开始尝试，如 4 或 8
-#     BATCH_SIZE =24
-#     results = run_batch_inference(model, tokenizer, test_data, image_base_path_dict, batch_size=BATCH_SIZE)
+#     # --- 5. 执行 vLLM 分布式推理 ---
+#     all_inference_results = run_vllm_inference(llm, tokenizer, test_data, image_base_path_dict, sampling_params)
     
-#     # [可选] 将中间结果保存到文件，方便调试或重复计算分数
-#     with open('/root/Documents/code/FM9G4B-V/inference/inference_results.json', 'w') as f:
-#         json.dump(results, f, indent=4)
-#     print("Inference results saved to inference_results.json")
+#     # --- 6. 保存和计算最终分数 (这部分逻辑完全复用) ---
+#     with open('/root/Documents/code/FM9G4B-V/data/inference_results_vllm.json', 'w') as f:
+#         json.dump(all_inference_results, f, indent=4)
+#     print(f"Aggregated inference results saved to 'inference_results_vllm.json'. Total items: {len(all_inference_results)}")
 
-#     # 5.获取测试结果
-#     # 如果是从文件加载，可以: with open('inference_results.json', 'r') as f: results = json.load(f)
 #     print("Calculating final scores...")
-#     score = calculate_final_scores(results)
-##############################################################################################################
-
+#     score = calculate_final_scores(all_inference_results)
+###########################################################################################################################################
 
 
 #这个Dataset，collect_fn,inference函数，主函数，都是accelerator+分布式预测的东西############################################################
